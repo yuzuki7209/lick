@@ -8,12 +8,7 @@ interface PianoKeyboardProps {
   onOctaveChange: (o: number) => void;
 }
 
-interface KeyDef {
-  pitch: NoteName;
-  accidental: NoteAccidental;
-  isBlack: boolean;
-  label: string;
-}
+interface KeyDef { pitch: NoteName; accidental: NoteAccidental; isBlack: boolean; label: string; }
 
 const WHITE_KEYS: KeyDef[] = [
   { pitch: 'c', accidental: '', isBlack: false, label: 'C' },
@@ -25,9 +20,7 @@ const WHITE_KEYS: KeyDef[] = [
   { pitch: 'b', accidental: '', isBlack: false, label: 'B' },
 ];
 
-// Black key positions (relative to white keys): after C, D, F, G, A
-const BLACK_KEY_POSITIONS = [0, 1, 3, 4, 5]; // index of preceding white key
-
+const BLACK_KEY_POSITIONS = [0, 1, 3, 4, 5];
 const BLACK_KEYS: KeyDef[] = [
   { pitch: 'c', accidental: '#', isBlack: true, label: 'C#' },
   { pitch: 'd', accidental: '#', isBlack: true, label: 'D#' },
@@ -36,91 +29,50 @@ const BLACK_KEYS: KeyDef[] = [
   { pitch: 'a', accidental: '#', isBlack: true, label: 'A#' },
 ];
 
-const WHITE_KEY_W = 40;
-const WHITE_KEY_H = 120;
-const BLACK_KEY_W = 26;
-const BLACK_KEY_H = 74;
+const WW = 38, WH = 110, BW = 24, BH = 68;
 
 export default function PianoKeyboard({ onNote, octave, onOctaveChange }: PianoKeyboardProps) {
   const [pressed, setPressed] = useState<string | null>(null);
 
-  function handlePress(key: KeyDef) {
-    const toneName = `${key.label}${octave}`;
+  function press(key: KeyDef) {
+    const tone = `${key.label}${octave}`;
     setPressed(key.label + octave);
-    audioEngine.previewNote(toneName);
+    audioEngine.previewNote(tone);
     onNote(key.pitch, octave, key.accidental);
-    setTimeout(() => setPressed(null), 200);
+    setTimeout(() => setPressed(null), 180);
   }
 
-  const totalWidth = WHITE_KEYS.length * WHITE_KEY_W;
-
   return (
-    <div className="flex flex-col items-center gap-3">
-      {/* Octave selector */}
-      <div className="flex items-center gap-3 text-sm text-gray-300">
-        <button
-          onClick={() => onOctaveChange(Math.max(2, octave - 1))}
-          className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-white transition-colors"
-        >
-          ▼
-        </button>
-        <span className="text-white font-mono text-base min-w-[60px] text-center">
-          Octave {octave}
-        </span>
-        <button
-          onClick={() => onOctaveChange(Math.min(7, octave + 1))}
-          className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-white transition-colors"
-        >
-          ▲
-        </button>
+    <div className="flex flex-col items-center gap-3 ui-sans">
+      <div className="flex items-center gap-3 text-sm text-[#5c4a28]">
+        <button onClick={() => onOctaveChange(Math.max(2, octave - 1))}
+          className="w-8 h-8 rounded border border-[#d4c4a0] bg-[#f7f2e4] hover:bg-[#ede4cc] text-[#1c1610] font-bold transition-colors">▼</button>
+        <span className="w-20 text-center font-mono text-[#8b6914] font-semibold">Octave {octave}</span>
+        <button onClick={() => onOctaveChange(Math.min(7, octave + 1))}
+          className="w-8 h-8 rounded border border-[#d4c4a0] bg-[#f7f2e4] hover:bg-[#ede4cc] text-[#1c1610] font-bold transition-colors">▲</button>
       </div>
-
-      {/* Piano keys */}
-      <div
-        className="relative select-none"
-        style={{ width: totalWidth, height: WHITE_KEY_H }}
-      >
-        {/* White keys */}
+      <div className="relative select-none" style={{ width: WHITE_KEYS.length * WW, height: WH }}>
         {WHITE_KEYS.map((key, i) => {
-          const isActive = pressed === key.label + octave;
+          const active = pressed === key.label + octave;
           return (
-            <div
-              key={key.label}
-              onMouseDown={() => handlePress(key)}
-              onTouchStart={(e) => { e.preventDefault(); handlePress(key); }}
-              className={`absolute border border-gray-400 rounded-b-md cursor-pointer transition-all duration-75 flex items-end justify-center pb-2 text-xs font-bold select-none
-                ${isActive ? 'bg-blue-200 border-blue-400' : 'bg-white hover:bg-gray-50 active:bg-blue-100'}`}
-              style={{
-                left: i * WHITE_KEY_W,
-                width: WHITE_KEY_W - 1,
-                height: WHITE_KEY_H,
-                zIndex: 1,
-              }}
-            >
-              <span className="text-gray-500 text-xs">{key.label}{octave}</span>
+            <div key={key.label} onMouseDown={() => press(key)}
+              onTouchStart={e => { e.preventDefault(); press(key); }}
+              className={`absolute border border-[#c4b89a] rounded-b cursor-pointer flex items-end justify-center pb-2 text-xs font-medium transition-all duration-75
+                ${active ? 'bg-[#f0e4b0] border-[#8b6914]' : 'bg-white hover:bg-[#fdfaf2]'}`}
+              style={{ left: i * WW, width: WW - 1, height: WH, zIndex: 1 }}>
+              <span className="text-[#a08456] text-[10px]">{key.label}</span>
             </div>
           );
         })}
-
-        {/* Black keys */}
         {BLACK_KEYS.map((key, i) => {
-          const whiteIdx = BLACK_KEY_POSITIONS[i];
-          const isActive = pressed === key.label + octave;
+          const active = pressed === key.label + octave;
           return (
-            <div
-              key={key.label}
-              onMouseDown={(e) => { e.stopPropagation(); handlePress(key); }}
-              onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); handlePress(key); }}
-              className={`absolute rounded-b-sm cursor-pointer transition-all duration-75 flex items-end justify-center pb-1 text-white text-xs select-none
-                ${isActive ? 'bg-blue-600' : 'bg-gray-900 hover:bg-gray-700 active:bg-blue-700'}`}
-              style={{
-                left: whiteIdx * WHITE_KEY_W + WHITE_KEY_W * 0.65,
-                width: BLACK_KEY_W,
-                height: BLACK_KEY_H,
-                zIndex: 2,
-              }}
-            >
-              <span className="text-gray-400 text-xs" style={{ fontSize: 9 }}>{key.label}</span>
+            <div key={key.label} onMouseDown={e => { e.stopPropagation(); press(key); }}
+              onTouchStart={e => { e.preventDefault(); e.stopPropagation(); press(key); }}
+              className={`absolute rounded-b cursor-pointer flex items-end justify-center pb-1 transition-all duration-75
+                ${active ? 'bg-[#8b6914]' : 'bg-[#1c1610] hover:bg-[#3a2e18]'}`}
+              style={{ left: BLACK_KEY_POSITIONS[i] * WW + WW * 0.65, width: BW, height: BH, zIndex: 2 }}>
+              <span className="text-[#c4b89a] text-[8px]">{key.label}</span>
             </div>
           );
         })}

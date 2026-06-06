@@ -1,218 +1,179 @@
-import { useState, useCallback, useRef } from 'react';
-import type { Lick, Note, Measure } from '../types/music';
-import { noteToMidi, CHORD_TONES, NOTE_TO_SEMITONE } from '../types/music';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import type { Lick, Note } from '../types/music';
+import { noteToMidi, CHORD_TONES, NOTE_TO_SEMITONE, DURATION_VALUES } from '../types/music';
 import { useMidi, type MidiNote } from '../hooks/useMidi';
 import { audioEngine } from '../utils/audioEngine';
 import StaffRenderer from './StaffRenderer';
 import PlaybackControls from './PlaybackControls';
 
-interface PracticeViewProps {
-  licks: Lick[];
-}
-
 type NoteStatus = 'neutral' | 'correct' | 'wrong' | 'active';
 
-interface PracticeState {
-  measureIdx: number;
-  noteIdx: number;
-  noteStatuses: Map<string, NoteStatus>; // noteId → status
+interface PracticeViewProps { licks: Lick[]; }
+
+interface NoteEntry { note: Note; measureIdx: number; noteIdx: number; }
+
+function buildNoteList(lick: Lick): NoteEntry[] {
+  const list: NoteEntry[] = [];
+  for (let mi = 0; mi < lick.measures.length; mi++) {
+    const nonRest = lick.measures[mi].notes.filter(n => !n.isRest);
+    nonRest.forEach((note, ni) => list.push({ note, measureIdx: mi, noteIdx: ni }));
+  }
+  return list;
 }
 
-function getExpectedMidi(note: Note): number {
-  return noteToMidi(note);
-}
-
-function getChordMidis(measure: Measure): Set<number> {
+function getChordMidis(lick: Lick, measureIdx: number): Set<number> {
   const midis = new Set<number>();
-  for (const chord of measure.chords) {
+  const chords = lick.measures[measureIdx]?.chords ?? [];
+  for (const chord of chords) {
     const root = NOTE_TO_SEMITONE[chord.root] ?? 0;
     const tones = CHORD_TONES[chord.quality] ?? [0, 4, 7];
-    for (const tone of tones) {
-      // Add across multiple octaves
-      for (let oct = 1; oct <= 6; oct++) {
-        midis.add((oct + 1) * 12 + root + tone);
-      }
+    for (const t of tones) {
+      for (let oct = 1; oct <= 6; oct++) midis.add((oct + 1) * 12 + root + t);
     }
   }
   return midis;
 }
 
-function getAllNotes(lick: Lick): { note: Note; measureIdx: number; noteIdx: number }[] {
-  const all: { note: Note; measureIdx: number; noteIdx: number }[] = [];
-  for (let mi = 0; mi < lick.measures.length; mi++) {
-    const notes = lick.measures[mi].notes.filter(n => !n.isRest);
-    for (let ni = 0; ni < notes.length; ni++) {
-      all.push({ note: notes[ni], measureIdx: mi, noteIdx: ni });
-    }
-  }
-  return all;
-}
-
 export default function PracticeView({ licks }: PracticeViewProps) {
   const [selectedLick, setSelectedLick] = useState<Lick | null>(null);
-  const [practiceState, setPracticeState] = useState<PracticeState | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [drumsEnabled, setDrumsEnabled] = useState(true);
-  const [bassEnabled, setBassEnabled] = useState(true);
+  const [statuses, setStatuses] = useState<Map<string, NoteStatus>>(new Map());
+  const [cursor, setCursor] = useState(0); // index into noteList
   const [score, setScore] = useState({ correct: 0, wrong: 0 });
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [autoAdvance, setAutoAdvance] = useState(true);
   const [practiceMode, setPracticeMode] = useState<'melody' | 'chord'>('melody');
-  const [, setChordStatuses] = useState<Map<string, NoteStatus>>(new Map());
-  const [currentPlayMeasure, setCurrentPlayMeasure] = useState(0);
-  const [currentPlayBeat, setCurrentPlayBeat] = useState(0);
 
-  const allNotesRef = useRef<{ note: Note; measureIdx: number; noteIdx: number }[]>([]);
+  const noteListRef = useRef<NoteEntry[]>([]);
+  const cursorRef = useRef(0);
+  const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  function startPractice(lick: Lick) {
+  function initPractice(lick: Lick) {
     setSelectedLick(lick);
-    allNotesRef.current = getAllNotes(lick);
-    const statuses = new Map<string, NoteStatus>();
-
-    // Mark all melody notes as neutral
-    for (const { note } of allNotesRef.current) {
-      statuses.set(note.id, 'neutral');
-    }
-
-    // Find first non-rest note
-    const firstNonRest = allNotesRef.current[0];
-    if (firstNonRest) {
-      statuses.set(firstNonRest.note.id, 'active');
-    }
-
-    setPracticeState({
-      measureIdx: firstNonRest?.measureIdx ?? 0,
-      noteIdx: 0,
-      noteStatuses: statuses,
-    });
+    noteListRef.current = buildNoteList(lick);
+    const m = new Map<string, NoteStatus>();
+    noteListRef.current.forEach((e, i) => m.set(e.note.id, i === 0 ? 'active' : 'neutral'));
+    setStatuses(m);
+    setCursor(0); cursorRef.current = 0;
     setScore({ correct: 0, wrong: 0 });
-    setChordStatuses(new Map());
   }
 
-  function resetPractice() {
-    if (selectedLick) startPractice(selectedLick);
+  // Auto-advance: schedule next note advance based on BPM
+  function scheduleAutoAdvance(lick: Lick, noteIdx: number) {
+    if (!autoAdvance) return;
+    if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    const entry = noteListRef.current[noteIdx];
+    if (!entry) return;
+    const beatMs = 60000 / lick.bpm;
+    const noteBeats = DURATION_VALUES[entry.note.duration] * (entry.note.isDotted ? 1.5 : 1);
+    const ms = beatMs * noteBeats * 2; // wait 2× note duration before auto-advance
+
+    autoTimerRef.current = setTimeout(() => {
+      advanceCursor(lick, noteIdx, 'neutral');
+    }, ms);
   }
 
-  // Build display measures with status applied
+  function advanceCursor(lick: Lick, fromIdx: number, statusForCurrent: NoteStatus) {
+    const list = noteListRef.current;
+    setStatuses(prev => {
+      const next = new Map(prev);
+      const current = list[fromIdx];
+      if (current && statusForCurrent !== 'neutral') next.set(current.note.id, statusForCurrent);
+      const nextEntry = list[fromIdx + 1];
+      if (nextEntry) next.set(nextEntry.note.id, 'active');
+      return next;
+    });
+    const newCursor = fromIdx + 1;
+    setCursor(newCursor);
+    cursorRef.current = newCursor;
+    if (newCursor < list.length && autoAdvance) scheduleAutoAdvance(lick, newCursor);
+  }
+
+  const handleNoteOn = useCallback((midi: MidiNote) => {
+    const lick = selectedLick;
+    if (!lick) return;
+    const list = noteListRef.current;
+    const idx = cursorRef.current;
+
+    if (practiceMode === 'melody') {
+      const entry = list[idx];
+      if (!entry) return;
+      const expected = noteToMidi(entry.note);
+      const isCorrect = (midi.number - expected) % 12 === 0;
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+      setScore(s => ({ correct: s.correct + (isCorrect ? 1 : 0), wrong: s.wrong + (isCorrect ? 0 : 1) }));
+      advanceCursor(lick, idx, isCorrect ? 'correct' : 'wrong');
+    } else {
+      // Chord mode: check if note is in current measure's chord
+      const entry = list[idx];
+      if (!entry) return;
+      const chordMidis = getChordMidis(lick, entry.measureIdx);
+      const isCorrect = chordMidis.has(midi.number);
+      setScore(s => ({ correct: s.correct + (isCorrect ? 1 : 0), wrong: s.wrong + (isCorrect ? 0 : 1) }));
+    }
+  }, [selectedLick, practiceMode]);
+
+  const { isEnabled, inputs, selectedInput, enable, selectInput, error } = useMidi(handleNoteOn);
+
+  // When auto-advance mode is toggled, restart scheduling
+  useEffect(() => {
+    return () => { if (autoTimerRef.current) clearTimeout(autoTimerRef.current); };
+  }, []);
+
+  // BPM-based playback for practice
+  async function handlePlay() {
+    if (!selectedLick) return;
+    if (isPlaying) { audioEngine.stop(); setIsPlaying(false); return; }
+    setIsPlaying(true);
+    // Play the full score, cursor follows via position callback
+    audioEngine.setPositionCallback((mi, ni) => {
+      setCursor(ni);
+      cursorRef.current = ni;
+      setStatuses(prev => {
+        const next = new Map(prev);
+        const entry = noteListRef.current.find(e => e.measureIdx === mi && e.noteIdx === ni);
+        if (entry) next.set(entry.note.id, 'active');
+        return next;
+      });
+    });
+    await audioEngine.play(selectedLick);
+  }
+
   const displayMeasures = selectedLick
     ? selectedLick.measures.map(m => ({
         ...m,
-        notes: m.notes.map(n => ({
-          ...n,
-          status: practiceState?.noteStatuses.get(n.id) ?? 'neutral',
-        })),
+        notes: m.notes.map(n => ({ ...n, status: statuses.get(n.id) ?? 'neutral' })),
       }))
     : [];
 
-  const handleNoteOn = useCallback((midiNote: MidiNote) => {
-    if (!selectedLick || !practiceState) return;
-
-    if (practiceMode === 'melody') {
-      const allNotes = allNotesRef.current;
-      const currentEntry = allNotes.find(
-        e => e.measureIdx === practiceState.measureIdx &&
-             e.note.id === [...practiceState.noteStatuses.entries()]
-               .find(([, s]) => s === 'active')?.[0]
-      );
-
-      if (!currentEntry) return;
-
-      const expected = getExpectedMidi(currentEntry.note);
-      // Allow an octave tolerance for ease
-      const isCorrect = Math.abs(midiNote.number - expected) % 12 === 0;
-      const status: NoteStatus = isCorrect ? 'correct' : 'wrong';
-
-      setScore(prev => ({
-        correct: prev.correct + (isCorrect ? 1 : 0),
-        wrong: prev.wrong + (isCorrect ? 0 : 1),
-      }));
-
-      // Update statuses
-      const newStatuses = new Map(practiceState.noteStatuses);
-      newStatuses.set(currentEntry.note.id, status);
-
-      // Find next note
-      const currentIdx = allNotes.indexOf(currentEntry);
-      const nextEntry = allNotes[currentIdx + 1];
-
-      if (nextEntry) {
-        newStatuses.set(nextEntry.note.id, 'active');
-        setPracticeState({
-          measureIdx: nextEntry.measureIdx,
-          noteIdx: nextEntry.noteIdx,
-          noteStatuses: newStatuses,
-        });
-      } else {
-        // Completed!
-        setPracticeState({ ...practiceState, noteStatuses: newStatuses });
-      }
-    } else {
-      // Chord mode: check if played note is in the current measure's chord
-      const measure = selectedLick.measures[practiceState.measureIdx];
-      const chordMidis = getChordMidis(measure);
-      const isCorrect = chordMidis.has(midiNote.number);
-      const noteKey = `${midiNote.number}`;
-
-      setChordStatuses(prev => new Map(prev).set(noteKey, isCorrect ? 'correct' : 'wrong'));
-      setScore(prev => ({
-        correct: prev.correct + (isCorrect ? 1 : 0),
-        wrong: prev.wrong + (isCorrect ? 0 : 1),
-      }));
-    }
-  }, [selectedLick, practiceState, practiceMode]);
-
-  const { isSupported, isEnabled, inputs, enable, error } = useMidi(handleNoteOn);
-
-  async function handlePlay() {
-    if (!selectedLick) return;
-    if (isPlaying) {
-      audioEngine.stop();
-      setIsPlaying(false);
-      return;
-    }
-    setIsPlaying(true);
-    audioEngine.setPositionCallback((mi, bi) => {
-      setCurrentPlayMeasure(mi);
-      setCurrentPlayBeat(bi);
-    });
-    await audioEngine.play(selectedLick, { drums: drumsEnabled, bass: bassEnabled, melody: false });
-  }
-
-  function handleStop() {
-    audioEngine.stop();
-    audioEngine.setPositionCallback(null);
-    setIsPlaying(false);
-  }
-
-  const accuracy = score.correct + score.wrong > 0
-    ? Math.round(score.correct / (score.correct + score.wrong) * 100)
-    : null;
+  const currentEntry = noteListRef.current[cursor];
+  const total = score.correct + score.wrong;
+  const accuracy = total > 0 ? Math.round(score.correct / total * 100) : null;
 
   if (licks.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-20 text-center">
-        <div className="text-6xl mb-4">🎹</div>
-        <h3 className="text-xl font-semibold text-gray-400 mb-2">연습할 릭이 없습니다</h3>
-        <p className="text-gray-600 text-sm">먼저 편집기에서 릭을 만들어 저장하세요!</p>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <div className="text-5xl mb-4 opacity-40">🎹</div>
+        <p className="text-[#8b6914] font-serif text-xl">저장된 악보가 없습니다</p>
+        <p className="text-[#a08456] text-sm mt-2 ui-sans">편집기에서 악보를 만들어 저장하세요</p>
       </div>
     );
   }
 
   return (
     <div className="space-y-4">
-      {/* Lick selection */}
-      <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
-        <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">연습할 릭 선택</h3>
-        <div className="flex flex-wrap gap-2">
-          {licks.map(lick => (
-            <button
-              key={lick.id}
-              onClick={() => startPractice(lick)}
-              className={`px-4 py-2 rounded-xl text-sm font-medium transition-all
-                ${selectedLick?.id === lick.id
-                  ? 'bg-purple-600 text-white shadow-lg shadow-purple-900/30'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+      {/* Score selection */}
+      <div className="bg-[#fffef9] border border-[#d4c4a0] rounded-xl p-4 shadow-sm">
+        <h3 className="text-xs font-bold text-[#8b6914] uppercase tracking-widest mb-3 ui-sans">악보 선택</h3>
+        <div className="flex flex-wrap gap-2 ui-sans">
+          {licks.map(l => (
+            <button key={l.id} onClick={() => initPractice(l)}
+              className={`px-4 py-2 rounded-xl text-sm font-medium border transition-all
+                ${selectedLick?.id === l.id
+                  ? 'bg-[#1c1610] text-[#f7f2e4] border-[#1c1610] shadow'
+                  : 'bg-[#f7f2e4] text-[#5c4a28] border-[#d4c4a0] hover:bg-[#ede4cc]'}`}
             >
-              {lick.name}
-              <span className="ml-2 text-xs opacity-60">{lick.bars}마디</span>
+              {l.name}
+              <span className="ml-2 text-[10px] opacity-60">{l.bars}마디</span>
             </button>
           ))}
         </div>
@@ -220,125 +181,106 @@ export default function PracticeView({ licks }: PracticeViewProps) {
 
       {selectedLick && (
         <>
-          {/* MIDI input status */}
-          <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
-            <div className="flex items-center justify-between flex-wrap gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-1">MIDI 입력</h3>
-                {isEnabled ? (
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                    <span className="text-green-400 text-sm">
-                      연결됨 {inputs.length > 0 ? `(${inputs.join(', ')})` : '(디바이스 없음)'}
-                    </span>
-                  </div>
-                ) : (
-                  <span className="text-gray-500 text-sm">MIDI 미연결</span>
-                )}
-                {error && <p className="text-red-400 text-xs mt-1">{error}</p>}
-              </div>
-
-              <div className="flex gap-2 items-center">
-                {!isEnabled && isSupported && (
-                  <button
-                    onClick={enable}
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-semibold transition-colors"
-                  >
-                    🎹 MIDI 활성화
+          {/* MIDI + settings row */}
+          <div className="bg-[#fffef9] border border-[#d4c4a0] rounded-xl p-4 shadow-sm ui-sans">
+            <div className="flex flex-wrap gap-4 items-center">
+              {/* MIDI */}
+              <div className="flex items-center gap-2">
+                {!isEnabled ? (
+                  <button onClick={enable}
+                    className="px-3 py-2 text-xs bg-[#1c1610] text-[#f7f2e4] rounded-lg hover:bg-[#3a2e18] transition-colors font-semibold">
+                    🎹 MIDI 연결
                   </button>
+                ) : (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-[#2d7a3a] animate-pulse inline-block" />
+                    {inputs.length > 1 ? (
+                      <select value={selectedInput} onChange={e => selectInput(Number(e.target.value))}
+                        className="bg-[#f7f2e4] border border-[#d4c4a0] rounded px-2 py-1 text-xs text-[#1c1610]">
+                        {inputs.map((n, i) => <option key={i} value={i}>{n}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-xs text-[#2d7a3a]">{inputs[0] ?? '장치 없음'}</span>
+                    )}
+                  </>
                 )}
-                {!isSupported && (
-                  <span className="text-red-400 text-xs">Chrome 브라우저 필요</span>
-                )}
-
-                {/* Practice mode */}
-                <div className="flex gap-1">
-                  {(['melody', 'chord'] as const).map(mode => (
-                    <button
-                      key={mode}
-                      onClick={() => setPracticeMode(mode)}
-                      className={`px-3 py-2 rounded-lg text-xs font-medium transition-all
-                        ${practiceMode === mode ? 'bg-teal-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
-                    >
-                      {mode === 'melody' ? '🎵 멜로디' : '🎼 코드'}
-                    </button>
-                  ))}
-                </div>
+                {error && <span className="text-xs text-[#9b2020]">{error}</span>}
               </div>
+
+              <div className="w-px h-6 bg-[#d4c4a0]" />
+
+              {/* Practice mode */}
+              <div className="flex gap-1">
+                {(['melody', 'chord'] as const).map(mode => (
+                  <button key={mode} onClick={() => setPracticeMode(mode)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all
+                      ${practiceMode === mode ? 'bg-[#5c4a28] text-white border-[#3a2e18]' : 'bg-[#f7f2e4] text-[#5c4a28] border-[#d4c4a0] hover:bg-[#ede4cc]'}`}>
+                    {mode === 'melody' ? '🎵 멜로디' : '🎼 코드'}
+                  </button>
+                ))}
+              </div>
+
+              <div className="w-px h-6 bg-[#d4c4a0]" />
+
+              {/* Auto advance toggle */}
+              <label className="flex items-center gap-2 cursor-pointer text-xs text-[#5c4a28]">
+                <div className={`relative w-9 h-5 rounded-full transition-colors ${autoAdvance ? 'bg-[#8b6914]' : 'bg-[#d4c4a0]'}`}
+                  onClick={() => setAutoAdvance(p => !p)}>
+                  <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${autoAdvance ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                </div>
+                자동 진행
+              </label>
             </div>
           </div>
 
-          {/* Score display */}
-          <div className="flex gap-4 bg-gray-800 rounded-xl p-4 border border-gray-700">
-            <div className="flex-1 flex flex-col items-center">
-              <span className="text-xs text-gray-500 uppercase tracking-wider mb-1">정확도</span>
-              <span className={`text-3xl font-bold ${
-                accuracy === null ? 'text-gray-600' :
-                accuracy >= 80 ? 'text-green-400' :
-                accuracy >= 60 ? 'text-yellow-400' : 'text-red-400'
-              }`}>
-                {accuracy !== null ? `${accuracy}%` : '-'}
-              </span>
-            </div>
-            <div className="flex-1 flex flex-col items-center">
-              <span className="text-xs text-gray-500 mb-1">정답</span>
-              <span className="text-2xl font-bold text-green-400">{score.correct}</span>
-            </div>
-            <div className="flex-1 flex flex-col items-center">
-              <span className="text-xs text-gray-500 mb-1">오답</span>
-              <span className="text-2xl font-bold text-red-400">{score.wrong}</span>
-            </div>
-            <div className="flex items-center">
-              <button
-                onClick={resetPractice}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded-lg text-sm transition-colors"
-              >
-                🔄 초기화
-              </button>
-            </div>
+          {/* Score */}
+          <div className="grid grid-cols-3 gap-3 ui-sans">
+            {[
+              { label: '정확도', value: accuracy !== null ? `${accuracy}%` : '—',
+                color: accuracy === null ? '#a08456' : accuracy >= 80 ? '#2d7a3a' : accuracy >= 60 ? '#8b6914' : '#9b2020' },
+              { label: '정답', value: score.correct, color: '#2d7a3a' },
+              { label: '오답', value: score.wrong, color: '#9b2020' },
+            ].map(item => (
+              <div key={item.label} className="bg-[#fffef9] border border-[#d4c4a0] rounded-xl p-3 text-center shadow-sm">
+                <div className="text-[10px] text-[#a08456] uppercase tracking-wider mb-1">{item.label}</div>
+                <div className="text-2xl font-bold font-serif" style={{ color: item.color }}>{item.value}</div>
+              </div>
+            ))}
           </div>
 
-          {/* Staff with note status coloring */}
-          <div className="bg-white rounded-xl overflow-hidden shadow-xl">
-            <StaffRenderer
-              measures={displayMeasures}
-              currentMeasure={currentPlayMeasure}
-              currentBeat={currentPlayBeat}
-              practiceMode={true}
-            />
-          </div>
+          {/* Staff */}
+          <StaffRenderer
+            measures={displayMeasures}
+            currentMeasure={currentEntry?.measureIdx}
+          />
 
           {/* Legend */}
-          <div className="flex gap-4 text-xs text-gray-500 bg-gray-800/40 rounded-xl p-3 border border-gray-700/40">
-            <span className="flex items-center gap-1">
-              <span className="w-3 h-3 rounded-full bg-amber-400 inline-block" /> 현재 위치
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-3 h-3 rounded-full bg-green-500 inline-block" /> 정답
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-3 h-3 rounded-full bg-red-500 inline-block" /> 오답
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-3 h-3 rounded-full bg-gray-500 inline-block" /> 미연주
-            </span>
+          <div className="flex gap-4 text-xs text-[#a08456] ui-sans bg-[#fffef9] border border-[#d4c4a0] rounded-xl p-3">
+            {[
+              { color: '#8b6914', label: '현재 음' },
+              { color: '#2d7a3a', label: '정답' },
+              { color: '#9b2020', label: '오답' },
+              { color: '#c4b89a', label: '미연주' },
+            ].map(({ color, label }) => (
+              <span key={label} className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: color }} />
+                {label}
+              </span>
+            ))}
+            <button onClick={() => initPractice(selectedLick)}
+              className="ml-auto px-3 py-1 rounded border border-[#d4c4a0] bg-[#f7f2e4] text-[#5c4a28] hover:bg-[#ede4cc] transition-colors">
+              🔄 초기화
+            </button>
           </div>
 
-          {/* Backing track playback */}
-          <div className="space-y-1">
-            <p className="text-xs text-gray-500 px-1">반주 재생 (멜로디 없이 드럼+베이스만)</p>
+          {/* Playback for score reference */}
+          <div>
+            <p className="text-xs text-[#a08456] mb-2 ui-sans">악보 재생 (피아노 소리로 참고)</p>
             <PlaybackControls
-              isPlaying={isPlaying}
-              bpm={selectedLick.bpm}
-              rhythmPattern={selectedLick.rhythmPattern}
-              drumsEnabled={drumsEnabled}
-              bassEnabled={bassEnabled}
+              isPlaying={isPlaying} bpm={selectedLick.bpm}
               onPlay={handlePlay}
-              onStop={handleStop}
+              onStop={() => { audioEngine.stop(); audioEngine.setPositionCallback(null); setIsPlaying(false); }}
               onBpmChange={() => {}}
-              onRhythmChange={() => {}}
-              onDrumsToggle={() => setDrumsEnabled(p => !p)}
-              onBassToggle={() => setBassEnabled(p => !p)}
             />
           </div>
         </>
